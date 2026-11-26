@@ -346,6 +346,63 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// How a caller's frame is written in the log: the module's file name and the
+/// address's offset inside it, module-relative so that it can be compared
+/// with the console build without the host's load addresses. Pure, for a test.
+fn frame_text(module: &str, offset: usize) -> String {
+    format!("{module}+{offset:#x}")
+}
+
+/// The module that holds `address` and the offset of the address inside it,
+/// through the loader's own tables. The address comes from our stack, but the
+/// lookup is done by the kernel: the module is only named, never read.
+#[cfg(windows)]
+fn module_and_offset(address: usize) -> Option<(String, usize)> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    // SAFETY: the address is one of our own frames and the module handle is
+    // the loader's output; the flag says the handle is not to be released.
+    let found = unsafe { GetModuleHandleExW(flags, address as *const u16, &mut module) };
+    if found == 0 || module.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: the buffer and its length are ours; the loader writes at most
+    // that many UTF-16 units and returns how many, zero on failure.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) } as usize;
+    let path = &path[..len.min(path.len())];
+    let name = path
+        .iter()
+        .rposition(|&c| c == u16::from(b'\\'))
+        .map_or(path, |at| &path[at + 1..]);
+    let name = String::from_utf16_lossy(name);
+    let offset = address.wrapping_sub(module as usize);
+    Some((name, offset))
+}
+
+/// The frames that called an unimplemented device method, for the first few
+/// calls: the address of each is taken from our own stack by the system's
+/// unwind, never dereferenced, and only the first [`FRAME_CAPTURES`] calls are
+/// walked. Twelve frames is a bound on both the walk and the log line.
+#[cfg(windows)]
+fn caller_frames(skip: u32) -> Vec<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    const FRAMES: usize = 12;
+    let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); FRAMES];
+    // SAFETY: the array and its length are ours; the system writes the return
+    // addresses of at most FRAMES frames and returns how many it wrote.
+    let count = unsafe { RtlCaptureStackBackTrace(skip, FRAMES as u32, frames.as_mut_ptr(), std::ptr::null_mut()) };
+    let count = usize::from(count).min(FRAMES);
+    frames[..count]
+        .iter()
+        .filter_map(|&frame| module_and_offset(frame as usize))
+        .map(|(module, offset)| frame_text(&module, offset))
+        .collect()
+}
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -368,6 +425,26 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    // The caller's return addresses: bounded to the first calls and to
+    // FRAME_CAPTURES walks, so a title that calls these every frame does not
+    // pay for a stack walk in the log path.
+    #[cfg(windows)]
+    {
+        static FRAME_CAPTURES: AtomicU32 = AtomicU32::new(0);
+        const FRAME_CAPTURES_MAX: u32 = 16;
+        if calls <= 4 || calls.is_power_of_two() {
+            let taken = FRAME_CAPTURES.fetch_add(1, Ordering::Relaxed);
+            if taken < FRAME_CAPTURES_MAX {
+                let frames = caller_frames(2);
+                tracing::warn!(
+                    slot = format_args!("{:#x}", SLOT),
+                    calls,
+                    frames = %frames.join(" "),
+                    "a pipeline creation method that is not implemented: the frames that called it"
+                );
+            }
+        }
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -583,5 +660,26 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+    /// A frame is named module-relative, the way the console's build is named,
+    /// so that the two can be compared without the host's load addresses.
+    #[test]
+    fn a_frame_is_written_module_relative() {
+        assert_eq!(frame_text("victory.exe", 0x2477578), "victory.exe+0x2477578");
+        assert_eq!(frame_text("victory-gpu.dll", 0), "victory-gpu.dll+0x0");
+    }
+
+    /// The walk is bounded, names every frame it returns through the loader,
+    /// and dereferences nothing: a frame is an address, not memory we read.
+    #[cfg(windows)]
+    #[test]
+    fn the_caller_walk_is_bounded_and_named() {
+        let frames = caller_frames(0);
+        assert!(frames.len() <= 12, "{} frames", frames.len());
+        for frame in &frames {
+            let (module, offset) = frame.rsplit_once('+').expect("module+offset");
+            assert!(!module.is_empty());
+            assert!(usize::from_str_radix(offset.trim_start_matches("0x"), 16).is_ok(), "{frame}");
+        }
     }
 }

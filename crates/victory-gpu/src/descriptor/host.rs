@@ -856,6 +856,50 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+// Adapted from trustno1-coder/VIctory-NVIDIA a9632bc8 (GPL-3.0-or-later).
+// Reserve at least half of a capped heap for title descriptors and keep
+// its final null descriptor outside both partitions.
+fn dynamic_slots_requested(asked: Option<&str>, null: u32) -> u32 {
+    if null == 0 { return DYNAMIC; }
+    let upper = null / 2;
+    let lower = DYNAMIC.min(upper);
+    asked.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DYNAMIC).clamp(lower, upper)
+}
+
+#[cfg(test)]
+mod capped_dynamic_tests {
+    use super::*;
+
+    #[test]
+    fn expanded_dynamic_pool_reserves_the_null_and_title_slots() {
+        assert_eq!(dynamic_slots_requested(Some("524288"), 999_999), 499_999);
+        assert_eq!(dynamic_slots_requested(None, 999_999), DYNAMIC);
+        assert_eq!(dynamic_slots_requested(Some("garbage"), 999_999), DYNAMIC);
+        assert_eq!(dynamic_slots_requested(Some("1"), 999_999), DYNAMIC);
+        assert_eq!(dynamic_slots_requested(Some("4294967295"), 999_999), 499_999);
+        assert_eq!(dynamic_slots_requested(Some("524288"), 0), DYNAMIC);
+    }
+
+    #[test]
+    fn allocation_uses_slots_beyond_the_old_fixed_capacity() {
+        let Some(mut heap) = HostHeap::new(false, 4) else { panic!("D3D12 host required"); };
+        // A real heap, with a deliberately larger allocator partition. This
+        // checks the search bound and wrap point, not another copy of the planner.
+        let slots = DYNAMIC + 100;
+        assert!(slots + heap.count < unsafe { heap.heap.GetDesc() }.NumDescriptors);
+        heap.dynamic = slots;
+        *heap.next.lock().unwrap() = (DYNAMIC, vec![false; slots as usize]);
+        heap.free.store(slots, std::sync::atomic::Ordering::Relaxed);
+        let first = heap.dynamic(80).unwrap();
+        assert_eq!(first, heap.count + DYNAMIC);
+        assert_eq!(heap.next.lock().unwrap().0, DYNAMIC + 80);
+        let next = heap.dynamic(20).unwrap();
+        assert_eq!(next, first + 80);
+        heap.release(first, 80);
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -876,7 +920,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -888,6 +931,12 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else {
+            dynamic_slots_requested(std::env::var("VICTORY_DYNAMIC_SLOTS").ok().as_deref(), null)
+        };
+        if extra > DYNAMIC {
+            tracing::info!(slots = extra, null, "expanded host dynamic descriptor pool");
+        }
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -953,8 +1002,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1068,7 +1117,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1098,7 +1147,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1848,6 +1897,74 @@ impl HostHeap {
         }
         self.mirror(index, handle, false);
         true
+    }
+
+    /// [`HostHeap::mirror_copied`] for every record of one changed page of
+    /// the title's heap (`super::sync_heaps`): title slots `slots`, the
+    /// record of slot `i` at title address `start + i * step`, and `page`
+    /// the bytes read from title address `from` on. Returns the records
+    /// looked at and those mirrored.
+    ///
+    /// The same records are mirrored as one by one. What differs is the
+    /// work for the others, which are nearly all of them (some 330,000
+    /// looked at a frame for 14,000 mirrored, 16 ms, run 225): the lock of
+    /// the fingerprints is taken once for the page and not once for each
+    /// record, and a record whose fingerprint is the one last seen is done
+    /// with before the question whether its slot was a table's lately. So
+    /// the count of slots "left to the draws" is now of records that
+    /// changed, not of every record on the page. The slots to mirror are
+    /// made after the page's walk, in slot order as before.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let handle = start + index * step;
+                // A record that straddles the range's ends is left to the
+                // range that holds its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                // None past the host heap's slots, as `mirror_copied`.
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                // The record last seen, or a slot never looked at that
+                // holds nothing: as it was.
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                // A table's slot lately: left to its draws, and looked at
+                // again next time.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
+        }
+        (looked, due.len() as u64)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

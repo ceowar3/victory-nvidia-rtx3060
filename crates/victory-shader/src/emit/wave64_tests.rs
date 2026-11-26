@@ -1115,6 +1115,98 @@ fn paired_lanes_sum_halves_as_the_consoles_tree() {
     eprintln!("ran on the hardware device: the sum {tree:#x} of the console's tree");
 }
 
+#[test]
+fn wave32_uniform_branch_can_ballot_a_complement_mask() {
+    let mut words = vec![
+        0x7E10_02FF, 0x77, // v_mov_b32 v8, 0x77
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF84_0003, // s_cbranch_scc0 past body
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0x8906_C16A, // s_xor_b32 s6, vcc_lo, -1
+        0x7E10_0206, // v_mov_b32 v8, s6
+    ];
+    words.extend(stores([8, 0, 0, 0]));
+    let native = native_with(&words, false, 32, 0);
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = result.expect("whole wave reaches the selected uniform arm");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for value in [0, 1] {
+        let Some(got) = run_paired(&shader, [value, 0, 0, 0], 128) else { return };
+        for lane in 0..32 { assert_eq!(got[lane * 4], if value == 0 { 1 } else { 0x77 }); }
+    }
+}
+#[test]
+fn wave32_complement_mask_in_uniform_block_includes_inactive_exec_bits() {
+    let mut words = vec![
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0x8906_C16A, // s_xor_b32 s6, vcc_lo, -1
+        0x7E10_0206, // v_mov_b32 v8, s6
+    ];
+    words.extend(stores([8, 0, 0, 0]));
+    let native = native_with(&words, false, 32, 0);
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = result.expect("uniform wave32 mask complement");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = run_paired(&shader, [0, 0, 0, 0], 128) else { return };
+    for lane in 0..32 { assert_eq!(got[lane * 4], 1); }
+}
+#[test]
+fn wave32_restored_exec_mask_keeps_lanes_outside_the_branch() {
+    let mut words = vec![
+        0x7E10_02FF, 0x77, // v_mov_b32 v8, 0x77
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+        0xBF88_0003, // s_cbranch_execz past the body
+        0xBEFE_030C, // s_mov_b32 exec_lo, s12 (restore the whole wave)
+        0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+        0x7E10_026A, // v_mov_b32 v8, vcc_lo (mask as a number)
+        0xBEFE_030C, // restore EXEC on the skip edge too
+    ];
+    words.extend(stores([8, 0, 0, 0]));
+    for threads in [32, 64, 128] {
+        let native = native_with(&words, false, threads, 0);
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let result = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        let shader = result.expect("wave32 widened EXEC needs wave-wide control flow");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for count in [0, 1, 8, 31, 32, 33, 64, 128] {
+            let Some(got) = run_paired(&shader, [count, 0, 0, 0], threads * 4) else { return };
+
+            for lane in 0..threads as usize {
+                let base = (lane as u32 / 32) * 32;
+                let want = if count <= base { 0x77 } else if base == 0 { 0xFFFF_FFFE } else { u32::MAX };
+                assert_eq!(got[lane * 4], want, "threads {threads}, count {count}, lane {lane}");
+            }
+        }
+    }
+}
+
 /// The lens-flare scans' allocation (`lens_flares:CS_ScanMip1`, 0x5c0-0x61c): in a branch
 /// of the lanes below s0, the first lane adds the wave's count times a size (s1) to a
 /// counter, and each lane takes base + below × size with `v_mad_u32_u24`. That is the

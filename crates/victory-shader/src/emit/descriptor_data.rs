@@ -120,8 +120,8 @@ impl<'a> Lower<'a> {
                     (props, None)
                 }
                 // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                    ((11, 0), None)
+                Fields::Smem { .. } if used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) => {
+                    ((11 | u, 0), None)
                 }
                 // A constant buffer: nothing of its descriptor is a number.
                 Fields::Smem { .. } => {

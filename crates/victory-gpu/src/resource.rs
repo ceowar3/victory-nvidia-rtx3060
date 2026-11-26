@@ -2313,6 +2313,11 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    #[cfg(windows)]
+    if let Some(bytes) = footprint(&desc).and_then(|f| usize::try_from(f.size).ok()) {
+        // Any resource may alias a pending texture's backing, including buffers.
+        crate::texback::remapped(resource.data() as usize, bytes);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
@@ -2322,7 +2327,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2553,6 +2560,28 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Texture dimensions and format for CPU-visible texture readback selection.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() { return None; }
+    let r = resource(this);
+    (r.desc.dimension == 3 && r.desc.sample_count <= 1
+        && crate::texback::whole_resource_is_one_subresource(
+            mip_count(&r.desc), u32::from(r.desc.depth_or_array_size)))
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Console layout and backing memory for a single-plane texture.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() { return None; }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER { return None; }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else { return None; };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description

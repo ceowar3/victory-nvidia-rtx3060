@@ -292,12 +292,19 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers on first use; VICTORY_PIPELINE_WORKERS overrides the
+/// default (half the logical processors, 2 to 8), bounded by available CPUs.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .map_or((cpus / 2).clamp(2, 8), |v| v.min(cpus));
+        tracing::info!(workers, cpus, "starting CPU pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))

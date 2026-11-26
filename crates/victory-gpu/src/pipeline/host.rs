@@ -92,6 +92,24 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| matches!(self.targets.RTFormats[i].0,
+            3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64);
+        if !(0..count).any(|i| integer(i) && blend.RenderTarget[if blend.IndependentBlendEnable.as_bool() { i } else { 0 }].BlendEnable.as_bool()) {
+            return blend;
+        }
+        // Expand shared state before adjusting only integer outputs.
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in 0..count {
+            if integer(i) { blend.RenderTarget[i].BlendEnable = false.into(); }
+        }
+        blend
+    }
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -601,7 +619,8 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, ms_code, ps_code, g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, state = %g.describe(),
+                        host_blend = ?g.host_blend(), "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -646,7 +665,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -927,6 +946,11 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    // The host's blend state, as the vertex path takes it: the title enables
+    // blending on integer render targets, which D3D12 refuses with
+    // E_INVALIDARG (2026-11-25: mesh f5e50eb2108c425b + pixel
+    // ce3f0432a08f1d35, target 2 is R8_UINT).
+    let blend = g.host_blend();
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -946,7 +970,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -965,7 +989,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1041,6 +1065,91 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_runtime_render_target_format_support() {
+        let host = super::host().expect("a D3D12 GPU is required for this diagnostic");
+        for format in [super::DXGI_FORMAT(41), super::DXGI_FORMAT(115), super::DXGI_FORMAT(62)] {
+            let mut support = super::D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
+            };
+            // SAFETY: the query writes exactly the supplied support structure.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    super::D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    std::mem::size_of_val(&support) as u32,
+                )
+            }.expect("format capability query failed");
+            eprintln!("runtime format {}: support1={:#x}, support2={:#x}",
+                format.0, support.Support1.0, support.Support2.0);
+        }
+    }
+    #[test]
+    fn integer_target_disables_blending_without_changing_color_target() {
+        let mut g = super::GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = super::DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = super::DXGI_FORMAT_R8_UINT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 15;
+        let blend = g.host_blend();
+        assert!(blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!blend.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(blend.RenderTarget[1].RenderTargetWriteMask, 15);
+        assert!(g.blend.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    /// A pixel shader for [R32_FLOAT, R8G8B8A8_UNORM, R8_UINT].
+    const PS_THREE_TARGETS: &str = "struct O { float4 c0 : SV_Target0; float4 c1 : SV_Target1;
+        uint c2 : SV_Target2; };
+        O main() { O o; o.c0 = 1; o.c1 = 1; o.c2 = 1; return o; }";
+
+    /// The mesh path takes the host's blend state too: a title state that
+    /// enables blending on an integer target (slot 2, R8_UINT) makes
+    /// D3D12 refuse the pipeline ("this format does not support blending",
+    /// mesh f5e50eb2108c425b + pixel ce3f0432a08f1d35).
+    #[test]
+    fn a_mesh_pipeline_blends_nothing_on_an_integer_target() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS_THREE_TARGETS, "ps_6_5");
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        // The captured state of the refused pair: no depth, three targets,
+        // the third an integer one, blending enabled on each.
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R32_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g.blend.IndependentBlendEnable = true.into();
+        for i in 0..3 {
+            g.blend.RenderTarget[i].BlendEnable = true.into();
+            g.blend.RenderTarget[i].RenderTargetWriteMask = 15;
+        }
+        assert!(!g.host_blend().RenderTarget[2].BlendEnable.as_bool());
+        let name = super::super::library::name(
+            "mesh integer target test",
+            &root_blob,
+            &[&ms, &ps],
+            &g.describe(),
+        );
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name)
+            .expect("a mesh pipeline whose integer target blends nothing is made");
+    }
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -1180,7 +1289,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
