@@ -737,6 +737,68 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
 fn view_stride(view: &View) -> Option<u32> {
+    let (stride, raw, format) = view_elements(view)?;
+    Some(if stride > 0 {
+        stride
+    } else if raw {
+        1
+    } else {
+        crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32)
+    })
+}
+
+/// The console's unsigned integer buffer formats, by name rather than by
+/// number (no `DXGI_FORMAT` value is spelled out here: the `windows`
+/// crate's table is the only one).
+pub(crate) const UINT_FORMATS: [DXGI_FORMAT; 11] = [
+    DXGI_FORMAT_R32G32B32A32_UINT,
+    DXGI_FORMAT_R32G32B32_UINT,
+    DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT_R32G32_UINT,
+    DXGI_FORMAT_R10G10B10A2_UINT,
+    DXGI_FORMAT_R8G8B8A8_UINT,
+    DXGI_FORMAT_R16G16_UINT,
+    DXGI_FORMAT_R32_UINT,
+    DXGI_FORMAT_R8G8_UINT,
+    DXGI_FORMAT_R16_UINT,
+    DXGI_FORMAT_R8_UINT,
+];
+
+/// [`UINT_FORMATS`]' signed counterparts.
+pub(crate) const SINT_FORMATS: [DXGI_FORMAT; 10] = [
+    DXGI_FORMAT_R32G32B32A32_SINT,
+    DXGI_FORMAT_R32G32B32_SINT,
+    DXGI_FORMAT_R16G16B16A16_SINT,
+    DXGI_FORMAT_R32G32_SINT,
+    DXGI_FORMAT_R8G8B8A8_SINT,
+    DXGI_FORMAT_R16G16_SINT,
+    DXGI_FORMAT_R32_SINT,
+    DXGI_FORMAT_R8G8_SINT,
+    DXGI_FORMAT_R16_SINT,
+    DXGI_FORMAT_R8_SINT,
+];
+
+/// What else the table of strides says of a typed buffer view of an integer
+/// format (`victory_shader::emit::VIEW_INTEGER`); 0 for any other view: a
+/// float, normalized, typeless, raw or structured one is still a float.
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let Some((0, false, format)) = view_elements(view) else {
+        return 0;
+    };
+    let format = DXGI_FORMAT(format as i32);
+    if UINT_FORMATS.contains(&format) {
+        VIEW_INTEGER
+    } else if SINT_FORMATS.contains(&format) {
+        VIEW_INTEGER | VIEW_SIGNED
+    } else {
+        0
+    }
+}
+
+/// A buffer view's structure stride, whether it is raw, and its format;
+/// `None` if `view` is not a buffer view.
+fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -747,23 +809,16 @@ fn view_stride(view: &View) -> Option<u32> {
         _ => return None,
     };
     // SAFETY: buffer views' union members.
-    let (stride, raw, format) = unsafe {
+    Some(unsafe {
         if unordered {
             let d = uav_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         } else {
             let d = srv_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         }
-    };
-    Some(if stride > 0 {
-        stride
-    } else if raw {
-        1
-    } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
     })
 }
 
@@ -1155,6 +1210,22 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Writes the word of the table of element strides for the dynamic slot
+    /// `index`, which holds `view` of a table made afresh: shaders ask it
+    /// whether a typed view in a table is of an integer format
+    /// (`victory_shader::emit::VIEW_INTEGER`).
+    pub(crate) fn dynamic_word(&self, index: u32, view: Option<&View>) {
+        if let Some((_, _, data)) = &self.strides
+            && index >= self.count
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let word = view.and_then(view_stride).unwrap_or(0) | view.map_or(0, view_kind);
+            // SAFETY: inside the mapping; the slot is this caller's until it
+            // is released.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -1645,12 +1716,13 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        let kind = view.map_or(0, view_kind);
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -3161,6 +3233,84 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// Typed buffer views of integer formats are marked in the table of
+    /// strides; float, normalized, typeless, raw and structured ones are not.
+    ///
+    /// The formats are named, never numbered: the only table of `DXGI_FORMAT`
+    /// values is the `windows` crate's. (PR 93f44d9's list of numbers is the
+    /// same table; a review that read `R10G10B10A2_UNORM` as 25 and
+    /// `R16G16_UNORM` as 36 was off by one from 24 on, where the typeless
+    /// and `_SRGB` members start.)
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_table_of_strides() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format: u32, stride, flags| {
+            View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]))
+        };
+        let at = |format: DXGI_FORMAT| uav(format.0 as u32, 0, 0);
+        for format in UINT_FORMATS {
+            assert_eq!(view_kind(&at(format)), VIEW_INTEGER, "{format:?}");
+        }
+        for format in SINT_FORMATS {
+            assert_eq!(view_kind(&at(format)), VIEW_INTEGER | VIEW_SIGNED, "{format:?}");
+        }
+        // Float, normalized, sRGB and typeless formats of the same widths.
+        for format in [
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16_FLOAT,
+            DXGI_FORMAT_R16G16_UNORM,
+            DXGI_FORMAT_R16G16_SNORM,
+            DXGI_FORMAT_R16G16_TYPELESS,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_R11G11B10_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+        ] {
+            assert_eq!(view_kind(&at(format)), 0, "{format:?}");
+        }
+        assert_eq!(view_kind(&uav(12, 0, D3D12_BUFFER_UAV_FLAG_RAW.0 as u32)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        // The stride keeps its bits beside the kind's.
+        assert_eq!(view_stride(&at(DXGI_FORMAT_R16G16B16A16_UINT)), Some(8));
+        assert_eq!(view_stride(&at(DXGI_FORMAT_R16_UINT)), Some(2));
+        assert_eq!(view_stride(&uav(0, 16, 0)).unwrap() & !VIEW_STRIDE_BITS, 0);
+        // The numbers, for the record: this is the whole integer set.
+        let names = |fs: &[DXGI_FORMAT]| {
+            fs.iter().map(|f| format!("{}={}", f.0, view_kind(&at(*f)))).collect::<Vec<_>>().join(" ")
+        };
+        eprintln!("UINT: {}", names(&UINT_FORMATS));
+        eprintln!("SINT: {}", names(&SINT_FORMATS));
+    }
+
+    /// The word both writers of the table build (`stride | kind`, the fill
+    /// of the heap and `dynamic_word` of a table made afresh) keeps the
+    /// stride below the kinds' bits: the d16 accesses of `victory-shader`
+    /// mask it back with `VIEW_STRIDE_BITS`.
+    #[test]
+    fn the_word_of_an_integer_view_keeps_its_stride_below_the_kinds_bits() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        let at = |format: DXGI_FORMAT| {
+            View::Unordered(0, 0, Some([format.0 as u32, 1, 0, 0, 64, 0, 0, 0, 0, 0]))
+        };
+        for (format, kind, bytes) in [
+            (DXGI_FORMAT_R16G16B16A16_UINT, VIEW_INTEGER, 8),
+            (DXGI_FORMAT_R16G16B16A16_SINT, VIEW_INTEGER | VIEW_SIGNED, 8),
+            (DXGI_FORMAT_R16_UINT, VIEW_INTEGER, 2),
+            (DXGI_FORMAT_R32_SINT, VIEW_INTEGER | VIEW_SIGNED, 4),
+            (DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 8),
+        ] {
+            let v = at(format);
+            let word = view_stride(&v).unwrap() | view_kind(&v);
+            assert_eq!(word & VIEW_STRIDE_BITS, bytes, "{format:?}");
+            assert_eq!(word & !VIEW_STRIDE_BITS, kind, "{format:?}");
+        }
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -3689,5 +3839,351 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_word_tests {
+    //! A table of strides word written by HostHeap::dynamic_word into a live
+    //! heap slot past the title's, read back by a translated shader through
+    //! root SRV 255 while it reads the descriptor from that same slot.
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+
+    use super::*;
+    use victory_shader::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    use victory_shader::{Container, io, ir, resource, structure};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const VIEW_INTEGER: u32 = 1 << 31;
+    const VIEW_SIGNED: u32 = 1 << 30;
+
+    fn native() -> NativeProgram {
+        let mut words = vec![
+            0xBE85_0380,
+            0xF408_0202,
+            0xFA00_0000,
+            0xF408_0402,
+            0xFA00_0020,
+            0xF408_0502,
+            0xFA00_0040,
+            0xE20C_0000,
+            0x8002_0400,
+            0xE20C_0000,
+            0x8005_0600,
+            0xE070_0000,
+            0x8004_0400,
+            0xE070_0004,
+            0x8004_0500,
+            0xE070_0008,
+            0x8004_0600,
+            0xE070_000C,
+            0x8004_0700,
+        ];
+        words.push(S_ENDPGM);
+        let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 4,
+            slot: 1,
+        };
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                range(ResourceType::Srv, 0, 4, 8),
+                range(ResourceType::Uav, 8, 4, 0),
+                range(ResourceType::Srv, 16, 4, 8),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// An empty DXBC container (the test helper in the shader crate is
+    /// `cfg(test)` there).
+    fn empty_container() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(0x20);
+        bytes.extend_from_slice(b"DXBC");
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x20u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes
+    }
+
+    fn translate(native: &NativeProgram) -> victory_shader::emit::HostShader {
+        let container = empty_container();
+        let c = Container::parse(&container).expect("container");
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        victory_shader::emit::emit(&c, native, &p, &st, &io, &res).expect("emit")
+    }
+
+    fn transition(
+        r: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(r) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    fn desc(ptr: D3D12_CPU_DESCRIPTOR_HANDLE, slot: u32, step: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: ptr.ptr + (slot * step) as usize,
+        }
+    }
+
+    #[test]
+    fn a_dynamic_word_lands_in_its_slot_and_the_shader_reads_it() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let Some(host) = host() else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let dev = &host.device;
+        let first = heap.dynamic(3).expect("three dynamic slots");
+        assert!(first >= heap.count(), "a dynamic slot past the title's");
+        let shader = translate(&native());
+        let data = [0x8000_ffffu32, 0x0001_7fff];
+        unsafe {
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("queue");
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("list");
+            let buffer = |size: u64, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let make = |size: u64, heap_type, state, flags| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer(size, flags),
+                    state,
+                    None,
+                    &mut r,
+                )
+                .expect("committed resource");
+                r.expect("resource")
+            };
+            let src = make(16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+            let upload = make(16, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).expect("map upload");
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), 2);
+            upload.Unmap(0, None);
+            list.CopyBufferRegion(&src, 0, &upload, 0, 16);
+            list.ResourceBarrier(&[transition(
+                &src,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            let uav = make(
+                16,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            );
+            let readback = make(16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+            let step = dev.GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            let start = heap.heap.GetCPUDescriptorHandleForHeapStart();
+            let sint = |at: D3D12_CPU_DESCRIPTOR_HANDLE, first_element: u32| {
+                let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R16G16B16A16_SINT,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: u64::from(first_element),
+                            NumElements: 1,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                        },
+                    },
+                };
+                dev.CreateShaderResourceView(&src, Some(&d), at);
+            };
+            sint(desc(start, first, step), 0);
+            sint(desc(start, first + 2, step), 1);
+            heap.raw_uav_at(first + 1, &uav, 0, 16);
+            let mut words = [0u32; 10];
+            words[0] = DXGI_FORMAT_R16G16B16A16_SINT.0 as u32;
+            words[1] = 1;
+            let mut whole = [0u32; 16];
+            whole[..10].copy_from_slice(&words);
+            let view = View::Placed(false, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], whole);
+            heap.dynamic_word(first, Some(&view));
+            heap.dynamic_word(first + 2, Some(&view));
+            let (_, _, mapping) = heap.strides.as_ref().expect("strides table");
+            let known = [VIEW_INTEGER | VIEW_SIGNED | 8, 0, VIEW_INTEGER | VIEW_SIGNED | 8];
+            let got: Vec<u32> = (0..3)
+                .map(|k| *(*mapping as *const u32).add((first + k) as usize))
+                .collect();
+            assert_eq!(got, known, "words at slots");
+
+            assert_eq!(got[0], known[0], "the first slot's word");
+            assert_eq!(
+                *(*mapping as *const u32).add((first + 2) as usize),
+                known[2],
+                "the second element's slot's word"
+            );
+            let params = [
+                D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: victory_shader::emit::USER_DATA_SPACE,
+                            Num32BitValues: shader.user_data_dwords(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(victory_shader::emit::SLOT_STRIDES),
+                            RegisterSpace: victory_shader::emit::ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+            let rd = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                    Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                        NumParameters: 2,
+                        pParameters: params.as_ptr(),
+                        NumStaticSamplers: 0,
+                        pStaticSamplers: std::ptr::null(),
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                    },
+                },
+            };
+            let mut blob = None;
+            let mut error = None;
+            D3D12SerializeVersionedRootSignature(&rd, &mut blob, Some(&mut error))
+                .expect("root blob");
+            let blob = blob.expect("blob");
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = dev
+                .CreateRootSignature(0, bytes)
+                .expect("root signature");
+            let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: shader.dxil.as_ptr().cast(),
+                    BytecodeLength: shader.dxil.len(),
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&pso_desc)
+                .expect("pipeline state");
+            list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetPipelineState(&pso);
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            // The draw's user data is the descriptor's byte offset in the heap
+            // (`draw.rs::user_value`), and the shader reads the word at the same
+            // slot's index.
+            ud[4] = first * step;
+            list.SetComputeRoot32BitConstants(0, shader.user_data_dwords(), ud.as_ptr().cast(), 0);
+            list.SetComputeRootShaderResourceView(1, heap.strides_gpu().expect("strides"));
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[transition(
+                &uav,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyResource(&readback, &uav);
+            list.Close().expect("close");
+            queue.ExecuteCommandLists(&[Some(list.cast().expect("cast"))]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            queue.Signal(&fence, 1).expect("signal");
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = dev.GetDeviceRemovedReason() {
+                    panic!("device removed: {e}");
+                }
+                std::thread::yield_now();
+            }
+            let mut p = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).expect("map readback");
+            let got = std::slice::from_raw_parts(p.cast::<u32>(), 4).to_vec();
+            readback.Unmap(0, None);
+            assert_eq!(got, [data[0], data[1], 0, 0], "the shader read the dynamic slot's word");
+        }
     }
 }

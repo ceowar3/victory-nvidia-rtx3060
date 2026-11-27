@@ -992,6 +992,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed 16-bit RGBA buffer UAV (UINT, SINT or FLOAT) of this many
+    /// elements, zeroed.
+    TypedUav(DXGI_FORMAT, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1224,7 +1227,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1233,6 +1236,18 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::TypedUav(f, e) => {
+                                assert!(
+                                    matches!(
+                                        f,
+                                        DXGI_FORMAT_R16G16B16A16_UINT
+                                            | DXGI_FORMAT_R16G16B16A16_SINT
+                                            | DXGI_FORMAT_R16G16B16A16_FLOAT
+                                    ),
+                                    "typed UAV fixture only supports RGBA16"
+                                );
+                                (2 * e, f, e, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }

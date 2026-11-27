@@ -198,6 +198,11 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// GPU completion ends descriptor use even when allocator recycling is delayed.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -2228,6 +2233,40 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_detached_tables_are_reusable_before_allocator_recycling() {
+        let Some(gpu) = crate::host::host() else { return };
+        // Extended heap description: four descriptors, shader visible,
+        // followed by the optional zero placement address and size.
+        let description = [0u32, 4, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = std::ptr::null();
+        assert_eq!(crate::descriptor::create_heap(std::ptr::null(),
+            description.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let host = crate::descriptor::heap(heap).host().expect("host descriptor heap");
+        let first = host.dynamic(32).expect("dynamic slots");
+        let mut state = crate::draw::State::default();
+        state.hold_dynamic_for_test(heap as usize, first, 32);
+        let mut detached = Detached { host: gpu.new_list().unwrap(), _uploads: Vec::new(), _state: state };
+        let mut other_leases = Vec::new();
+        while let Some(other) = host.dynamic(32) {
+            assert_ne!(other, first, "in-flight list must retain its slots");
+            other_leases.push(other);
+        }
+        assert_eq!(host.dynamic(32), None, "all other slots remain in flight");
+        detached.release_tables();
+        let after = host.dynamic(32).unwrap();
+        assert_eq!(after, first, "completed list still held slots until allocator recycling");
+        detached.release_tables(); // idempotent: never releases the new lease.
+        assert_eq!(host.dynamic(32), None, "releasing twice must not free a new owner's slots");
+        host.release(after, 32);
+        for other in other_leases { host.release(other, 32); }
+        drop(detached);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

@@ -90,6 +90,10 @@ mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod integer_view_tests;
+#[cfg(all(test, windows))]
+mod quad_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -123,7 +127,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -516,8 +520,10 @@ fn emit_forms(
     // refusal if resource tracking or control-flow widening cannot prove it.
     if exact_only && native.stage == HwStage::Cs && !native.wave64 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        if let Ok(result) = widen(c, native, p, why) {
-            return Ok(result);
+        match widen(c, native, p, why) {
+            Ok(result) => return Ok(result),
+            Err(error) if why => eprintln!("WAVE32-WIDE retry failed: {error}"),
+            Err(_) => {}
         }
     }
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
@@ -2626,8 +2632,10 @@ mod barycentric_tests {
     fn pixel_quad_swizzle_without_discards_uses_quad_read_lane_at() {
         let [e0, e1] = exp_mrt0(2);
         let words = [
-            0xD8D4_80E4,
-            0x0300_0000, // ds_swizzle_b32 v3, v0 offset:0x80E4
+            // A non-identity, non-broadcast/exchange permutation: identity
+            // can disappear and common patterns use one quad operation.
+            0xD8D4_8027,
+            0x0300_0000, // ds_swizzle_b32 v3, v0 offset:0x8027
             v_add_f32(2, 3, 1),
             e0,
             e1,

@@ -27,6 +27,57 @@ use windows_sys::Win32::System::LibraryLoader::{
 use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+/// A bounded kernel copy: bad guest pointers must not fault the crash reporter.
+fn context_words(address: usize) -> Option<[u64; 8]> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut words = [0u64; 8];
+    let size = std::mem::size_of_val(&words);
+    if address == 0 || address.checked_add(size).is_none() {
+        return None;
+    }
+    let mut read = 0usize;
+    // SAFETY: only the kernel dereferences the untrusted source; the destination
+    // is our live fixed-size array. Partial or failed reads are never reported.
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), address as *const _,
+            words.as_mut_ptr().cast(), size, &mut read)
+    };
+    (ok != 0 && read == size).then_some(words)
+}
+
+/// Sequential bounded reads, not an atomic view of other title threads.
+fn context_snapshots(context: &CONTEXT) -> [(&'static str, u64, Option<[u64; 8]>); 6] {
+    [
+        ("rsp", context.Rsp), ("rbp", context.Rbp),
+        ("r13", context.R13), ("r13-before", context.R13.saturating_sub(32)),
+        ("rcx", context.Rcx), ("rdx", context.Rdx),
+    ].map(|(name, address)| (name, address, context_words(address as usize)))
+}
+
+#[cfg(test)]
+mod context_read_tests {
+    #[test]
+    fn exception_snapshot_captures_stack_and_operand_before_reporting() {
+        let stack = [0x1000u64; 8];
+        let operand = [0x18u64; 8];
+        let mut context: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rsp = stack.as_ptr() as u64;
+        context.Rcx = operand.as_ptr() as u64;
+        let saved = super::context_snapshots(&context);
+        assert_eq!(saved[0].2, Some(stack));
+        assert_eq!(saved[4].2, Some(operand));
+        assert_eq!(saved[5].2, None);
+    }
+    #[test]
+    fn crash_context_reads_owned_memory_and_rejects_null() {
+        let words = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(super::context_words(words.as_ptr() as usize), Some(words));
+        assert_eq!(super::context_words(0), None);
+        assert_eq!(super::context_words(usize::MAX - 8), None);
+    }
+}
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
 
@@ -452,6 +503,12 @@ unsafe fn thrown(p: &[usize]) -> String {
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+    // Capture before formatting, symbol lookup and unwind. Include first-chance
+    // reports so later exception handling cannot be mistaken for fault-time data.
+    // Other threads can still change memory between these sequential reads.
+    let snapshots = std::env::var_os("VICTORY_CRASH_CONTEXT")
+        .is_some_and(|v| v == "1")
+        .then(|| context_snapshots(context));
     let code = record.ExceptionCode;
     let at = record.ExceptionAddress as usize;
     let p = record.ExceptionInformation;
@@ -506,6 +563,14 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    if let Some(snapshots) = snapshots {
+        // SAFETY: obtaining the calling thread's identifier has no prerequisites.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        for (name, address, words) in snapshots {
+            line(format!("  context thread={thread} {name}@{address:#x} words={:x?}",
+                words));
+        }
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }

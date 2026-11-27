@@ -254,6 +254,45 @@ impl Drop for State {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn hold_dynamic_for_test(&mut self, heap: usize, first: u32, n: u32) {
+        self.dynamic.push((heap, first, n));
+    }
+
+    /// Whether a table's descriptors reach outside the mirrored title partition.
+    fn table_needs_fresh(
+        &self,
+        compute: bool,
+        slot: u8,
+        first: u32,
+        count: u32,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+    ) -> bool {
+        used.iter()
+            .filter(|u| u.root == RootType::Table && u.slot == slot)
+            .any(|u| first.checked_add(u.table_offset_dwords / 8).is_none_or(|i| i >= count))
+            || self.table_selected(compute, slot, indexed).iter()
+                .any(|&offset| first.checked_add(offset).is_none_or(|i| i >= count))
+    }
+
+    /// Draw-evaluable descriptor indices, shared by the boundary check and copy.
+    fn table_selected(&self, compute: bool, slot: u8, indexed: &[RootIndexedView]) -> Vec<u32> {
+        let mut selected: Vec<u32> = indexed.iter()
+            .filter(|index| index.table_slot == slot)
+            .map(|index| {
+                let constant = self.user_value(
+                    compute, index.constant_slot, RootType::Constants, index.constant_dword,
+                );
+                // Match the shader's wrapping i32 byte address, then descriptor shift.
+                index.byte_offset.wrapping_add(constant << index.shift) / 32
+            })
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -2497,22 +2536,25 @@ impl State {
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+        let slots: std::collections::BTreeSet<u8> = used.iter().filter(tables)
+            .map(|u| u.slot)
+            .chain(indexed.iter().map(|index| index.table_slot))
+            .collect();
+        for slot in slots {
+            if fresh.contains(&slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let (Some(host), Some(index)) = (heap.host(), heap.index(table)) else {
                 continue;
             };
-            if index >= host.count() {
-                fresh.push(u.slot);
+            if self.table_needs_fresh(compute, slot, index, host.count(), used, indexed) {
+                fresh.push(slot);
             }
         }
         fresh.sort_unstable();
@@ -2541,22 +2583,7 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
-            selected.sort_unstable();
-            selected.dedup();
+            let selected = self.table_selected(compute, slot, indexed);
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
@@ -2619,6 +2646,8 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // (What shaders ask of a typed view in a table: its kind.)
+                host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
@@ -2868,6 +2897,66 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+}
+
+#[cfg(test)]
+mod indexed_table_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_table_selection_crossing_the_title_partition_requires_fresh() {
+        let mut state = State::default();
+        state.graphics = vec![Root::None, Root::Constants(vec![20])];
+        state.compute = vec![Root::None, Root::Constants(vec![9])];
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let indexed = [RootIndexedView {
+            table_slot: 0,
+            constant_slot: 1,
+            constant_dword: 0,
+            byte_offset: 0,
+            shift: 5,
+        }];
+        // Static entry 499990 fits, but the graphics root selects 500010.
+        assert!(state.table_needs_fresh(false, 0, 499_990, 500_000, &used, &indexed));
+        // The compute root selects the last mirrored slot, 499999.
+        assert!(!state.table_needs_fresh(true, 0, 499_990, 500_000, &used, &indexed));
+        state.compute[1] = Root::Constants(vec![10]);
+        // The first dynamic slot must not be mistaken for a title descriptor.
+        assert!(state.table_needs_fresh(true, 0, 499_990, 500_000, &used, &indexed));
+    }
+
+    #[test]
+    fn indexed_table_selection_uses_wrapping_bytes_and_its_own_root() {
+        let mut state = State::default();
+        state.graphics = vec![Root::None, Root::Constants(vec![2, 20])];
+        let indexed = [
+            RootIndexedView {
+                table_slot: 0, constant_slot: 1, constant_dword: 0,
+                byte_offset: u32::MAX - 31, shift: 5,
+            },
+            RootIndexedView {
+                table_slot: 2, constant_slot: 1, constant_dword: 1,
+                byte_offset: 0, shift: 5,
+            },
+        ];
+        // 0xffffffe0 + (2 << 5) wraps to 32 bytes: descriptor one.
+        assert_eq!(state.table_selected(false, 0, &indexed), vec![1]);
+        assert_eq!(state.table_selected(false, 2, &indexed), vec![20]);
+        assert!(!state.table_needs_fresh(false, 0, 499_998, 500_000, &[], &indexed));
+        assert!(state.table_needs_fresh(false, 0, 499_999, 500_000, &[], &indexed));
+        // An indexed descriptor counts even without a static UsedResource entry.
+        assert!(state.table_needs_fresh(false, 2, 499_990, 500_000, &[], &indexed));
+        assert!(!state.table_needs_fresh(false, 3, 499_990, 500_000, &[], &indexed));
     }
 }
 

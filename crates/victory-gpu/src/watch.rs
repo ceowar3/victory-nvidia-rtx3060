@@ -20,7 +20,8 @@
 //! write by the title through any view of a guarded page faults like one
 //! at the guarded address (the guard makes every view of the page
 //! read-only, [`open`] gives them all back; not a page of more than
-//! [`MANY_VIEWS`] views). A
+//! [`MANY_VIEWS`] views). Above that cap each check conservatively reports
+//! the block written, since writes through its other views may not fault. A
 //! system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,7 +65,7 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -76,7 +77,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    ahead: Vec::new(),
+    ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -88,6 +89,55 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Sorted starts and prefix maximum ends, after AvatarManz c83e54c.
+/// A query still requires a single containing range, not merely a union.
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+    most: Vec<usize>,
+}
+
+impl Ahead {
+    const fn new() -> Self { Self { ranges: Vec::new(), most: Vec::new() } }
+    fn is_empty(&self) -> bool { self.ranges.is_empty() }
+    fn clear(&mut self) { self.ranges.clear(); self.most.clear(); }
+    fn push(&mut self, range: (usize, usize)) {
+        let at = self.ranges.partition_point(|r| *r <= range);
+        self.ranges.insert(at, range);
+        self.most.insert(at, 0);
+        let mut end = if at == 0 { 0 } else { self.most[at - 1] };
+        for i in at..self.ranges.len() {
+            end = end.max(self.ranges[i].1);
+            self.most[i] = end;
+        }
+    }
+    fn holds(&self, first: usize, last: usize) -> bool {
+        let n = self.ranges.partition_point(|r| r.0 <= first);
+        n != 0 && self.most[n - 1] >= last
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    #[test]
+    fn indexed_ranges_match_the_single_range_oracle_after_each_insert() {
+        let mut fast = super::Ahead::new();
+        let mut slow = Vec::new();
+        for range in [(8, 12), (0, 6), (4, 19), (8, 9), (24, 30), (19, 24)] {
+            fast.push(range);
+            slow.push(range);
+            for first in 0..=32 {
+                for last in first..=33 {
+                    assert_eq!(fast.holds(first, last), slow.iter().any(|&(a,b)| a <= first && last <= b));
+                }
+            }
+        }
+        assert!(!fast.holds(19, 30), "adjacent ranges must not be joined");
+        fast.clear();
+        assert!(fast.is_empty());
+        assert!(!fast.holds(0, 0));
+    }
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -241,7 +291,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.holds(first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -374,8 +424,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+        .holds(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -391,7 +440,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if j.ahead.holds(first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -536,6 +585,8 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Blocks above the alias cap cannot safely be noted clean.
+    many: BTreeSet<usize>,
     /// With [`view_known`]: blocks made read-only at least once since the
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
@@ -564,6 +615,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    many: BTreeSet::new(),
     viewed: BTreeSet::new(),
 });
 
@@ -613,6 +665,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        if g.many.contains(&block)
+            && crate::inplace::pages_of(block * BLOCK).len() <= MANY_VIEWS
+        {
+            g.many.remove(&block);
+        }
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
@@ -629,7 +686,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                if !g.many.contains(&block) {
+                    g.clean.insert(block);
+                }
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -702,12 +761,18 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
             let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
+            // One view needs no aliases guarded. Above the cap the other
+            // views stay writable, so the checked block must never be clean.
+            if shown.len() < 2 {
+                g.many.remove(&block);
                 continue;
             }
+            if shown.len() > MANY_VIEWS {
+                g.many.insert(block);
+                g.clean.remove(&block);
+                continue;
+            }
+            g.many.remove(&block);
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for alias in shown {
@@ -846,6 +911,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        g.many.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1026,6 +1092,9 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // Textures copied back for the title's CPU code no longer show the
     // allocation the copies were recorded against.
     crate::texback::remapped(at, len);
@@ -1042,10 +1111,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    // Only restore guards we own, including notifications made while the old
+    // view is still mapped. Forgetting protection alone leaves a read-only view
+    // with no guard state to open it on a later write.
+    open_here(&mut g, at, at.saturating_add(len));
+    let many: Vec<usize> = g.many.range(range).copied().collect();
+    for block in many {
+        g.many.remove(&block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1603,6 +1675,142 @@ mod tests {
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
     }
+    /// `n` more real mappings of the section `two_views` made, registered
+    /// as views of the same bytes; the caller unmaps them with the others.
+    fn extra_views(section: usize, bytes: usize, n: usize) -> Vec<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let mut views = Vec::with_capacity(n);
+        for _ in 0..n {
+            // SAFETY: another view of the live section, at a fresh address.
+            let view = unsafe {
+                MapViewOfFile(section as *mut _, FILE_MAP_WRITE, 0, 0, bytes).Value as usize
+            };
+            assert_ne!(view, 0);
+            crate::inplace::title_memory_view(view, bytes, section, 0);
+            views.push(view);
+        }
+        views
+    }
+    /// One view, no alias: the page is reported on its first check and
+    /// after the guarded view itself is written, then clean.
+    #[test]
+    fn a_single_view_reports_its_own_write_once() {
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        title_memory_remapped(two, SIZE);
+        assert_eq!(guard(one, one + SIZE), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        // SAFETY: the guarded view, opened by the handler.
+        unsafe { ((one + 8) as *mut u8).write_volatile(0x44) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        drop_views(section, &[one, two], SIZE);
+    }
+    /// A page shown in `MANY_VIEWS + 1` views is not guarded at every
+    /// view (the cap), but a write through one of the unguarded views must
+    /// still reach the guarded view's next check. Reporting it every time
+    /// is the conservative oracle: the copy sees the bytes, even though
+    /// no fault fired.
+    #[test]
+    fn a_write_through_the_sixty_fifth_view_reaches_the_guarded_one() {
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        // `one` and `two` plus 63 more real mappings: 65 views.
+        let extra = extra_views(section, SIZE, MANY_VIEWS - 1);
+        let pages = |block: usize| (one + block * BLOCK) / PAGE;
+        // The conservative oracle checks and copies this block every time;
+        // there is no fault to tell a write from no write.
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]));
+        let fifth = extra[extra.len() - 1];
+        // SAFETY: the 65th view is still writable (the cap leaves it alone).
+        unsafe { ((fifth + 8) as *mut u8).write_volatile(0x5a) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]), "the 65th view's write is lost");
+        // SAFETY: the page the guarded view shows, after the write.
+        assert_eq!(unsafe { *((one + 8) as *const u8) }, 0x5a);
+        let mut all = vec![one, two];
+        all.extend(extra);
+        drop_views(section, &all, SIZE);
+    }
+
+    /// When the extra views go away, the page is no longer above the cap:
+    /// a stale marker must not keep reporting it written forever.
+    #[test]
+    fn leaving_the_many_view_case_stops_reporting_forever() {
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let extra = extra_views(section, SIZE, MANY_VIEWS - 1);
+        let pages = |block: usize| (one + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]));
+        let fifth = extra[extra.len() - 1];
+        // SAFETY: the 65th view is still writable.
+        unsafe { ((fifth + 8) as *mut u8).write_volatile(0x5a) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]));
+        // The extra views go away; only `one` and `two` remain.
+        let mut gone = extra;
+        for view in gone.drain(..) {
+            title_memory_remapped(view, SIZE);
+            // SAFETY: the extra mapping made by `extra_views`.
+            unsafe {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(
+                    windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    },
+                )
+            };
+        }
+        // The page leaves the cap: one last conservative copy, then the
+        // ordinary clean path. A stale marker would report forever.
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]), "the last write is copied once");
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "stale many-view marker");
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A remap at the same address starts a new generation: the old
+    /// dirty page cannot make the new mapping's first check report a write
+    /// that happened before the remap.
+    #[test]
+    fn a_remap_does_not_carry_the_previous_generation_dirty_page() {
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |block: usize| (one + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]));
+        // SAFETY: the second view is writable until it is guarded.
+        unsafe { ((two + 8) as *mut u8).write_volatile(0x33) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(0)]));
+        title_memory_remapped(two, SIZE);
+        crate::inplace::title_memory_view(two, SIZE, section, 0);
+        assert_eq!(guard(two, two + SIZE), Some(vec![two / PAGE]), "the new view's first check");
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()), "the old dirty page leaked into the new mapping");
+        drop_views(section, &[one, two], SIZE);
+    }
+    /// The runtime says `[at, at + len)` is new and read-write while the
+    /// same view is still mapped. Forgetting the guard is not enough: a
+    /// write to the still-read-only page must not fault with no guard state
+    /// to open it.
+    #[test]
+    fn a_remap_gives_a_still_mapped_view_write_access_back() {
+        const SIZE: usize = BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        assert_eq!(guard(one, one + SIZE), Some(vec![one / PAGE]));
+        assert!(!writable(one), "the guard made the view read-only");
+        title_memory_remapped(one, SIZE);
+        assert!(writable(one), "a remap dropped the guard but left the page read-only");
+        // The runtime tells again the view it maps; then a copy asks.
+        crate::inplace::title_memory_view(one, SIZE, section, 0);
+        assert_eq!(guard(one, one + SIZE), Some(vec![one / PAGE]));
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    #[test]
+    fn an_empty_unaligned_remap_keeps_the_live_guard() {
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        title_memory_remapped(one + 1, 0);
+        assert!(!writable(one), "an empty remap opened a live guarded page");
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
 }
 
 #[cfg(test)]

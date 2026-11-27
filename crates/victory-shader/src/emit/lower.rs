@@ -4400,10 +4400,25 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. A pattern shared by every quad permits a
+    /// broadcast or exchange to use one quad operation instead of four reads.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xE4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xAA | 0xFF)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind,
+                    self.s.t.i32, 122, &[x, lane]);
+            }
+            Some(p @ (0xB1 | 0x4E | 0x1B)) => {
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(c, "quadOp.i32", Attr::NoUnwind,
+                    self.s.t.i32, 123, &[x, direction]);
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4574,7 +4589,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad || self.helpers_read(quad) {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -6428,6 +6444,35 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let word = self.slot_word(src, false)?;
+        Ok(word.map(|word| {
+            let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
+            self.s.m.bin(self.cur, Bin::And, word, bits)
+        }))
+    }
+
+    /// Whether the typed buffer view `src` names is one of an integer format,
+    /// and whether a signed one: of a view the program picks from the heap,
+    /// and of a view in a table too (the host keeps the word of a table's
+    /// slots as well). `None`: a view that is in neither.
+    fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
+        let Some(word) = self.slot_word(src, true)? else {
+            return Ok(None);
+        };
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let [int, signed] = [super::shader::VIEW_INTEGER, super::shader::VIEW_SIGNED].map(|bit| {
+            let bit = self.s.m.i32(bit);
+            let x = self.s.m.bin(c, Bin::And, word, bit);
+            self.s.m.cmp(c, pred::NE, x, zero)
+        });
+        Ok(Some((int, signed)))
+    }
+
+    /// The host's word for the buffer view `src` names: its stride and
+    /// format kind ([`super::shader::SLOT_STRIDES`]); `tables`: of a view in
+    /// a table too, not only of one picked from the heap.
+    fn slot_word(&mut self, src: &Source, tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -6435,7 +6480,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            .is_some_and(|p| p.root == RootType::ResourceHeap || tables && p.root == RootType::Table);
         if !heap {
             return Ok(None);
         }
@@ -6645,6 +6690,16 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
+        // This tree does not yet model inactive-source DPP8 semantics
+        // (#1582). Only enable the new pixel quad path when every program
+        // lane reaches this block and EXEC adds no per-instruction guard.
+        if self.s.pixel && matches!(v.dpp, Some(Dpp::Lanes { .. }))
+            && (self.x.st.guards[b][i].is_some()
+                || !all_lane_blocks(self.x.st)
+                    .is_some_and(|all| all.get(b).copied().unwrap_or(false)))
+        {
+            return Err("pixel DPP8 with unproved source-lane activity");
+        }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
@@ -6669,8 +6724,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Only DPP8 selections that stay inside each lane's own quad can
+        // use pixel quad reads. Cross-quad DPP8 keeps the compute-only path.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -6751,7 +6810,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad || self.helpers_read(quad) {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
@@ -10286,8 +10349,14 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is taken as f16, widened for the 32-bit float
+                // store; through a view of an integer format it is a 16-bit
+                // integer, zero- or sign-extended (after VIctory 4243a96a:
+                // the face network keeps its halves in UINT views, in
+                // tables, and its result was all zeros: faces stood still).
+                // shortcut: the handle stays a float one, whose bits the
+                // drivers pass.
+                let integer = if typed { self.integer_view(src)? } else { None };
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -10299,7 +10368,16 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let mut w = self.as_int(f);
+                    if let Some((int, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
+                        w = self.s.m.select(c, int, n, w);
+                    }
+                    wide.push(w);
                 }
                 vals = wide;
             }
@@ -10430,16 +10508,24 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR (an odd last high half 0); the low
+            // 16 bits of an integer view's (see the stores above).
+            let integer = if typed { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
+                    let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    if let Some((int, _)) = integer {
+                        let bits = self.as_int(f);
+                        let low = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, bits, low);
+                        h = self.s.m.select(c, int, low, h);
+                    }
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);

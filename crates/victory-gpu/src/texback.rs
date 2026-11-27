@@ -337,6 +337,24 @@ fn land_bytes(ticket: &Ticket, tiled: &mut [u8], texels: &Texels, mapped: &[u8])
     }
 }
 
+fn publish_changes(before: &[u8], after: &[u8], mut write: impl FnMut(usize, &[u8])) {
+    assert_eq!(before.len(), after.len());
+    let mut at = 0;
+    while at < after.len() {
+        if before[at] == after[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < after.len() && before[at] != after[at] {
+            at += 1;
+        }
+        // Never merge across unchanged bytes: the CPU may have written them
+        // since the snapshot, including padding and other subresources.
+        write(start, &after[start..at]);
+    }
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
@@ -358,6 +376,13 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    // Experimental: exact changed spans preserve newer CPU bytes outside
+    // them, but fragmented data can require many kernel copies. Do not enable
+    // until its ordering and frame cost are validated against the title.
+    static RANGES: OnceLock<bool> = OnceLock::new();
+    let before = RANGES.get_or_init(||
+        std::env::var_os("VICTORY_TEXTURE_BACK_RANGES").is_some_and(|v| v == "1")
+    ).then(|| tiled.clone());
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -373,7 +398,13 @@ pub(crate) fn land(back: &Back) {
     if !landed {
         return;
     }
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    if let Some(before) = before {
+        publish_changes(&before, &tiled, |offset, bytes| {
+            crate::host::copy_mapped((at + offset) as *mut u8, bytes.as_ptr(), bytes.len(), true);
+        });
+    } else {
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    }
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
@@ -384,6 +415,21 @@ pub(crate) fn land(back: &Back) {
 mod tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, TextureDesc};
+
+    #[test]
+    fn publishing_readback_preserves_new_cpu_bytes_outside_gpu_changes() {
+        let before = [0x11u8; 16];
+        let mut after = before;
+        after[4..8].fill(0x22);
+        let mut current = before;
+        // CPU changes padding after the snapshot, before publication.
+        current[10..14].fill(0xcc);
+        publish_changes(&before, &after, |at, bytes| {
+            current[at..at + bytes.len()].copy_from_slice(bytes);
+        });
+        assert_eq!(&current[4..8], &[0x22; 4]);
+        assert_eq!(&current[10..14], &[0xcc; 4]);
+    }
 
     #[test]
     fn whole_readback_rejects_untracked_mips_and_array_slices() {

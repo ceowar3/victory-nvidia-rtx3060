@@ -11,6 +11,8 @@ lighting, textures and streaming behavior remain incorrect. See
 This project does not distribute the game, its executable, extracted shaders,
 assets, saves or generated caches. Users provide their own compatible files.
 
+Latest update: [2026-11-26 source and known failures](docs/UPDATE-20261126.md). Alternative active build: [`belobug-20261126`](https://github.com/ceowar3/victory-nvidia-rtx3060/tree/belobug-20261126).
+
 ## Requirements
 
 Windows 11 x64, AVX2 CPU, D3D12 GPU with Shader Model 6.6 and mesh shaders.
@@ -36,8 +38,7 @@ copying dependencies from a game. See the original documentation below.
 The portable launcher uses `%LOCALAPPDATA%\VIctory-RTX3060` for its own cache,
 data and logs. It does not import or delete another runtime's saves. Keep the
 game outside this source repository. `-VerboseLogs` enables verbose diagnostics;
-`-LegacyDescriptors` restores the earlier descriptor-pool setting. Texture
-readback and unverified shader experiments are disabled in this launcher.
+`-LegacyDescriptors` restores the earlier descriptor-pool setting. Texture readback is enabled for CPU-visible consumers, including water interaction; unverified shader experiments remain disabled.
 
 ## Verification
 

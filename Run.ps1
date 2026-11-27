@@ -35,7 +35,7 @@ try {
     $env:VICTORY_TEXTURE_NO_WAIT = '1'
     $env:VICTORY_MERGE_RUNS = '4096'
     $env:VICTORY_MERGE_GAP = '0'
-    $env:VICTORY_TEXTURE_BACK = '0'
+    $env:VICTORY_TEXTURE_BACK = '1'
     if (-not $LegacyDescriptors) { $env:VICTORY_DYNAMIC_SLOTS = '524288' }
     $env:VICTORY_LOG = if ($VerboseLogs) { 'info' } else { 'warn' }
     $logs = Join-Path $runData 'logs'

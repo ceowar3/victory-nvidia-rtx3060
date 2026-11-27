@@ -76,6 +76,15 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
+        if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+            if let Some((at, first)) = use_at {
+                let source = Source::Loaded { load: site, first };
+                eprintln!("DESC-USE load={:#x} consumer={:#x} instruction={} first={} kind={:?}",
+                    inst.machine.offset, x.p.blocks[at.0].insts[at.1].machine.offset,
+                    x.p.blocks[at.0].insts[at.1].name(), first,
+                    self.used_kind(&source).map(|u| u.kind));
+            }
+        }
         // `sized`: no instruction uses the descriptor, the code reads a size from it
         // ([`Self::unused_descriptor_kind`]).
         let (first, used, uav, props, image, sized) = if let Some((at, first)) = use_at {

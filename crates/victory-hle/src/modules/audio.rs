@@ -497,9 +497,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -517,7 +518,15 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A skip or an input boundary may advance without producing PCM.
+        // Do not insert silence into a partial block while more input can
+        // complete it. Bound empty steps so one voice cannot monopolize its lock.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
             return;
         }
         let write = context.field(0, 27, 5);
@@ -543,12 +552,20 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title may refill either input without disabling this voice.
+        // A previously flushed tail must not be emitted again while idle.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -648,7 +665,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -998,6 +1018,132 @@ mod tests {
             }
         }
         data
+    }
+
+    fn direct_voice(skip: usize, ended: bool) -> Voice {
+        Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip,
+            ended,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn xma_skipped_frame_does_not_publish_a_short_block() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, BLOCK_BYTES as u32, 0x100, 2),
+            S_OK
+        );
+        let stream = silent_stream();
+        // SAFETY: both allocations above are live and cover these copies.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 2 | 1 << 20 | 1 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        let mut voice = direct_voice(xma::FRAME_SAMPLES, false);
+        voice.pcm.extend(std::iter::repeat_n(123i16, 64));
+        pump(context, &mut voice);
+        // The first decoded frame was skipped; consume a second one to
+        // fill the block, retaining its remaining samples for the next block.
+        assert_eq!(voice.trace.produced, SAMPLES_PER_BLOCK);
+        assert_eq!(voice.pcm.len(), xma::FRAME_SAMPLES + 64 - SAMPLES_PER_BLOCK);
+        assert_eq!(voice.trace.bad_frames, 0);
+        ApuFree(input);
+        ApuFree(output);
+    }
+
+    #[test]
+    fn xma_refilled_input_resumes_an_ended_voice_and_tail_is_not_replayed() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: input covers the two packets.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 2 | 1 << 20);
+        context.set(1, 3 << 27);
+        context.set(2, 32 | INPUT_INVALID << 26 | 1 << 31);
+        context.set(5, input_apu);
+        let mut voice = direct_voice(0, true);
+        assert!(
+            decode(context, &mut voice),
+            "new valid input must resume decoding"
+        );
+        assert!(!voice.ended);
+        assert_eq!(context.field(2, 26, 6), 0);
+        assert_eq!(voice.pcm.len(), xma::FRAME_SAMPLES);
+        // Out of input may flush overlap once, but never repeats that tail.
+        context.set_field(0, 20, 2, 0);
+        decode(context, &mut voice);
+        let samples = voice.pcm.len();
+        assert!(!decode(context, &mut voice));
+        assert_eq!(voice.pcm.len(), samples);
+        ApuFree(input);
+    }
+
+    #[test]
+    fn xma_final_partial_block_is_padded_once_without_replaying_tail() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(
+                &mut output,
+                &mut output_apu,
+                2 * BLOCK_BYTES as u32,
+                0x100,
+                2
+            ),
+            S_OK
+        );
+        // SAFETY: the two output blocks were allocated above.
+        unsafe { output.cast::<u8>().write_bytes(0x55, 2 * BLOCK_BYTES) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 2 << 22);
+        context.set(1, 1 << 31);
+        context.set(7, output_apu);
+        let mut voice = direct_voice(0, true);
+        voice.pcm.extend(std::iter::repeat_n(123i16, 64));
+        pump(context, &mut voice);
+        assert_eq!(voice.trace.produced, SAMPLES_PER_BLOCK);
+        assert_eq!(context.field(0, 27, 5), 1);
+        // SAFETY: the output ring remains live throughout these reads.
+        let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 2 * BLOCK_BYTES) };
+        assert!(
+            ring[..128]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|p| *p == 123i16.to_le_bytes())
+        );
+        assert!(ring[128..BLOCK_BYTES].iter().all(|&b| b == 0));
+        assert!(ring[BLOCK_BYTES..].iter().all(|&b| b == 0x55));
+        pump(context, &mut voice);
+        assert_eq!(voice.trace.produced, SAMPLES_PER_BLOCK);
+        assert_eq!(context.field(0, 27, 5), 1);
+        ApuFree(output);
     }
 
     #[test]
