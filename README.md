@@ -1,5 +1,12 @@
 # VIctory RTX 3060 — experimental integration
 
+## Descarga NVIDIA v2026.11.27.9
+
+[Guía de instalación paso a paso](docs/INSTALAR-NVIDIA-20261127.md) · [Instrucciones para tu IA](docs/PROMPT-INSTALACION-IA.md) · [Ejecutable y código](https://github.com/ceowar3/victory-nvidia-rtx3060/releases/tag/nvidia-v2026.11.27.9)
+
+Esta descarga usa una rama distinta de la integración paired descrita debajo.
+
+
 A Windows x64 fork/integration of VIctory with paired-lane shader translation,
 NVIDIA descriptor-heap handling and CPU/GPU transfer work. Maintained by this
 repository's owner; original authors and GPL notices are preserved.
